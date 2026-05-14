@@ -250,18 +250,25 @@ positions."
   (when ghostgrid-materialize-padding
     (let ((old-modified (buffer-modified-p))
           (inhibit-read-only t)
-          (ghostgrid--inhibit-refresh t))
-      (save-excursion
-        (goto-char (car overlay-region))
-        (cl-loop for base-line in base-lines
-                 while (<= (point) (cdr overlay-region))
-                 do (let* ((base-len (length base-line))
-                           (overlay-len (ghostgrid--current-line-char-length))
-                           (missing (- base-len overlay-len)))
-                      (when (> missing 0)
-                        (goto-char (line-end-position))
-                        (insert (make-string missing ?\s)))
-                      (forward-line 1))))
+          (ghostgrid--inhibit-refresh t)
+          ;; Use a marker, not the raw integer end from OVERLAY-REGION.  Padding
+          ;; inserted near the top of the grid moves the closing delimiter to the
+          ;; right; a stale integer end makes the loop think it has already
+          ;; passed the region after only a few wide rows.
+          (overlay-end-marker (copy-marker (cdr overlay-region) t)))
+      (unwind-protect
+          (save-excursion
+            (goto-char (car overlay-region))
+            (cl-loop for base-line in base-lines
+                     while (<= (point) overlay-end-marker)
+                     do (let* ((base-len (length base-line))
+                               (overlay-len (ghostgrid--current-line-char-length))
+                               (missing (- base-len overlay-len)))
+                          (when (> missing 0)
+                            (goto-char (line-end-position))
+                            (insert (make-string missing ?\s)))
+                          (forward-line 1))))
+        (set-marker overlay-end-marker nil))
       ;; Padding is infrastructure, not a user edit.  If the buffer was clean
       ;; before the refresh, keep it clean after adding spaces.  If the user
       ;; later edits and saves, those spaces can naturally become part of the
