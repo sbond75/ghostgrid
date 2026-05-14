@@ -35,6 +35,24 @@ are real buffer text; ghostgrid preserves the buffer's modified flag when it
 adds padding during refresh, but a later save can include those spaces."
   :type 'boolean)
 
+(defcustom ghostgrid-materialize-tabs t
+  "If non-nil, replace tabs in overlay-grid lines with equivalent spaces.
+
+The base grid may contain tabs for indentation, but ghost alignment is visual:
+a tab occupies columns up to the next tab stop, not one column.  Expanding tabs
+inside the overlay grid keeps buffer positions, visual columns, and ghost
+columns in the same coordinate system."
+  :type 'boolean)
+
+(defcustom ghostgrid-tab-width nil
+  "Tab width used for ghost-grid visual alignment.
+
+When nil, use each buffer's own `tab-width'.  Set this to an integer if the base
+and overlay buffers use different tab widths but the grids should still align
+with one chosen width."
+  :type '(choice (const :tag "Use each buffer's tab-width" nil)
+                 integer))
+
 (defface ghostgrid-ghost-face
   '((t (:inherit shadow :slant italic)))
   "Face used for ghost characters copied from the base buffer."
@@ -73,6 +91,26 @@ or:
 (defun ghostgrid--abs (file)
   "Return FILE as an absolute path."
   (expand-file-name file))
+
+(defun ghostgrid--effective-tab-width ()
+  "Return the tab width ghostgrid should use in the current buffer."
+  (max 1 (or ghostgrid-tab-width tab-width)))
+
+(defun ghostgrid--expand-tabs-in-string (s &optional width)
+  "Return S with tab characters expanded to spaces.
+WIDTH defaults to `ghostgrid--effective-tab-width' in the current buffer."
+  (let ((tab-stop (max 1 (or width (ghostgrid--effective-tab-width))))
+        (col 0)
+        pieces)
+    (dotimes (i (length s))
+      (let ((ch (aref s i)))
+        (if (= ch ?\t)
+            (let ((spaces (- tab-stop (% col tab-stop))))
+              (push (make-string spaces ?\s) pieces)
+              (setq col (+ col spaces)))
+          (push (char-to-string ch) pieces)
+          (setq col (+ col (max 1 (char-width ch)))))))
+    (apply #'concat (nreverse pieces))))
 
 (defun ghostgrid-save-associations ()
   "Persist `ghostgrid--table' to `ghostgrid-associations-file'."
@@ -158,12 +196,21 @@ The returned region is the inside of the [[...]] string, excluding delimiters."
       (_
        (user-error "ghostgrid: unknown region spec %S" spec)))))
 
-(defun ghostgrid--region-lines (buffer region)
-  "Return lines in BUFFER inside REGION as strings without text properties."
+(defun ghostgrid--region-lines (buffer region &optional expand-tabs)
+  "Return lines in BUFFER inside REGION as strings without text properties.
+When EXPAND-TABS is non-nil, return the lines in visual-column form with tab
+characters expanded to spaces."
   (with-current-buffer buffer
-    (let ((text (buffer-substring-no-properties (car region) (cdr region))))
+    (let ((lines (split-string
+                  (buffer-substring-no-properties (car region) (cdr region))
+                  "\n" nil)))
       ;; Keep empty rows.  This matters because the grid is line-based.
-      (split-string text "\n" nil))))
+      (if expand-tabs
+          (let ((width (ghostgrid--effective-tab-width)))
+            (mapcar (lambda (line)
+                      (ghostgrid--expand-tabs-in-string line width))
+                    lines))
+        lines))))
 
 (defun ghostgrid--whitespace-char-p (ch)
   "Return non-nil if CH is nil or whitespace."
@@ -243,10 +290,10 @@ that prevents duplicate ghost text from stacking and drifting sideways."
 (defun ghostgrid--ensure-overlay-padding (overlay-region base-lines)
   "Pad short overlay lines in OVERLAY-REGION to match BASE-LINES.
 
-This fixes the editing problem caused by displaying ghosts past EOL with
-`after-string': after-string text is visible, but point cannot move inside it.
-By inserting ordinary spaces first, the ghost columns become normal editable
-positions."
+BASE-LINES are already in visual-column form, with base tabs expanded.  This
+function can also expand tabs in the overlay grid so visual columns and buffer
+positions do not drift apart.  That matters for grids whose left edge is built
+with tabs: a tab is one buffer character, but several display columns."
   (when ghostgrid-materialize-padding
     (let ((old-modified (buffer-modified-p))
           (inhibit-read-only t)
@@ -261,12 +308,19 @@ positions."
             (goto-char (car overlay-region))
             (cl-loop for base-line in base-lines
                      while (<= (point) overlay-end-marker)
-                     do (let* ((base-len (length base-line))
-                               (overlay-len (ghostgrid--current-line-char-length))
-                               (missing (- base-len overlay-len)))
-                          (when (> missing 0)
-                            (goto-char (line-end-position))
-                            (insert (make-string missing ?\s)))
+                     do (let ((line-start (line-beginning-position))
+                              (base-len (length base-line)))
+                          (when ghostgrid-materialize-tabs
+                            ;; Bind `tab-width' so `untabify' uses the same tab
+                            ;; stops as ghostgrid's visual-column math.
+                            (let ((tab-width (ghostgrid--effective-tab-width)))
+                              (untabify line-start (line-end-position))))
+                          (goto-char line-start)
+                          (let* ((overlay-len (ghostgrid--current-line-char-length))
+                                 (missing (- base-len overlay-len)))
+                            (when (> missing 0)
+                              (goto-char (line-end-position))
+                              (insert (make-string missing ?\s))))
                           (forward-line 1))))
         (set-marker overlay-end-marker nil))
       ;; Padding is infrastructure, not a user edit.  If the buffer was clean
@@ -337,7 +391,7 @@ LINE-START and LINE-END are positions in the overlay buffer."
          (overlay-region (ghostgrid--resolve-region
                           (current-buffer)
                           (plist-get ghostgrid--entry :overlay-spec)))
-         (base-lines (ghostgrid--region-lines base-buffer base-region)))
+         (base-lines (ghostgrid--region-lines base-buffer base-region t)))
     (setq ghostgrid--base-buffer base-buffer)
     (ghostgrid--delete-overlays)
     (ghostgrid--ensure-overlay-padding overlay-region base-lines)
