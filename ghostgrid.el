@@ -24,6 +24,17 @@
 Higher values make the ghost display win over font-lock/tree-sitter faces."
   :type 'integer)
 
+(defcustom ghostgrid-materialize-padding t
+  "If non-nil, insert real spaces in short overlay lines before drawing ghosts.
+
+Emacs cannot put point inside pure `after-string' display text.  When this
+option is enabled, ghostgrid pads overlay-region lines out to the base line
+length with ordinary spaces.  That makes every ghost column an editable buffer
+position, so you can click, move, and type before a ghost character.  The spaces
+are real buffer text; ghostgrid preserves the buffer's modified flag when it
+adds padding during refresh, but a later save can include those spaces."
+  :type 'boolean)
+
 (defface ghostgrid-ghost-face
   '((t (:inherit shadow :slant italic)))
   "Face used for ghost characters copied from the base buffer."
@@ -52,6 +63,9 @@ or:
 
 (defvar-local ghostgrid--refresh-timer nil
   "Buffer-local idle timer used to debounce refreshes.")
+
+(defvar-local ghostgrid--inhibit-refresh nil
+  "Non-nil while ghostgrid is changing padding internally.")
 
 (defvar-local ghostgrid--base-watchers nil
   "In a base buffer, list of overlay buffers that should refresh after base edits.")
@@ -167,9 +181,24 @@ The returned region is the inside of the [[...]] string, excluding delimiters."
               'font-lock-face 'ghostgrid-ghost-face))
 
 (defun ghostgrid--delete-overlays ()
-  "Delete all live ghost overlays in the current buffer."
-  (mapc #'delete-overlay ghostgrid--overlays)
-  (setq ghostgrid--overlays nil))
+  "Delete every live ghost overlay in the current buffer.
+
+The list in `ghostgrid--overlays' is the normal fast path, but commands such as
+`revert-buffer' can leave stale zero-width display overlays around if a timer
+fires at an awkward time.  The property sweep is the belt-and-suspenders cleanup
+that prevents duplicate ghost text from stacking and drifting sideways."
+  (mapc (lambda (ov)
+          (when (overlayp ov)
+            (delete-overlay ov)))
+        ghostgrid--overlays)
+  (setq ghostgrid--overlays nil)
+  (remove-overlays (point-min) (point-max) 'ghostgrid t)
+  ;; `remove-overlays' is range-oriented; explicitly catch zero-width overlays
+  ;; pinned to the buffer edges.
+  (dolist (pos (list (point-min) (point-max)))
+    (dolist (ov (overlays-at pos))
+      (when (overlay-get ov 'ghostgrid)
+        (delete-overlay ov)))))
 
 (defun ghostgrid--add-display-overlay (beg end text)
   "Display TEXT over BEG..END as a ghost overlay."
@@ -207,6 +236,39 @@ The returned region is the inside of the [[...]] string, excluding delimiters."
    (+ line-start run-end)
    (substring base-line run-start run-end)))
 
+(defun ghostgrid--current-line-char-length ()
+  "Return the current line length in buffer characters."
+  (- (line-end-position) (line-beginning-position)))
+
+(defun ghostgrid--ensure-overlay-padding (overlay-region base-lines)
+  "Pad short overlay lines in OVERLAY-REGION to match BASE-LINES.
+
+This fixes the editing problem caused by displaying ghosts past EOL with
+`after-string': after-string text is visible, but point cannot move inside it.
+By inserting ordinary spaces first, the ghost columns become normal editable
+positions."
+  (when ghostgrid-materialize-padding
+    (let ((old-modified (buffer-modified-p))
+          (inhibit-read-only t)
+          (ghostgrid--inhibit-refresh t))
+      (save-excursion
+        (goto-char (car overlay-region))
+        (cl-loop for base-line in base-lines
+                 while (<= (point) (cdr overlay-region))
+                 do (let* ((base-len (length base-line))
+                           (overlay-len (ghostgrid--current-line-char-length))
+                           (missing (- base-len overlay-len)))
+                      (when (> missing 0)
+                        (goto-char (line-end-position))
+                        (insert (make-string missing ?\s)))
+                      (forward-line 1))))
+      ;; Padding is infrastructure, not a user edit.  If the buffer was clean
+      ;; before the refresh, keep it clean after adding spaces.  If the user
+      ;; later edits and saves, those spaces can naturally become part of the
+      ;; file, which is useful for fixed-width grid editing.
+      (unless old-modified
+        (set-buffer-modified-p nil)))))
+
 (defun ghostgrid--render-line (line-start line-end base-line overlay-line)
   "Render ghost chars for BASE-LINE on one overlay line.
 LINE-START and LINE-END are positions in the overlay buffer."
@@ -227,9 +289,11 @@ LINE-START and LINE-END are positions in the overlay buffer."
             (ghostgrid--render-existing-run line-start run-start col base-line))
         (setq col (1+ col))))
 
-    ;; Past EOL: attach an after-string at the overlay line end, preserving
-    ;; columns with literal padding spaces.
-    (when (< overlay-len base-len)
+    ;; Fallback for users who disable `ghostgrid-materialize-padding'.  This is
+    ;; visible, but not truly editable past EOL because Emacs does not put point
+    ;; inside after-string display text.
+    (when (and (not ghostgrid-materialize-padding)
+               (< overlay-len base-len))
       (let ((tail (make-string (- base-len overlay-len) ?\s))
             (has-ghost nil))
         (cl-loop for i from overlay-len below base-len
@@ -266,33 +330,40 @@ LINE-START and LINE-END are positions in the overlay buffer."
          (overlay-region (ghostgrid--resolve-region
                           (current-buffer)
                           (plist-get ghostgrid--entry :overlay-spec)))
-         (base-lines (ghostgrid--region-lines base-buffer base-region))
-         (overlay-lines (ghostgrid--region-lines (current-buffer) overlay-region))
-         (overlay-starts (ghostgrid--line-starts-in-region overlay-region)))
+         (base-lines (ghostgrid--region-lines base-buffer base-region)))
     (setq ghostgrid--base-buffer base-buffer)
     (ghostgrid--delete-overlays)
-    (cl-loop for base-line in base-lines
-             for overlay-line in overlay-lines
-             for line-start in overlay-starts
-             do (let ((line-end (save-excursion
-                                  (goto-char line-start)
-                                  (line-end-position))))
-                  (ghostgrid--render-line line-start line-end base-line overlay-line)))))
+    (ghostgrid--ensure-overlay-padding overlay-region base-lines)
+    ;; Padding can move the closing delimiter and therefore the resolved region
+    ;; end.  Resolve again before reading overlay lines or placing overlays.
+    (setq overlay-region (ghostgrid--resolve-region
+                          (current-buffer)
+                          (plist-get ghostgrid--entry :overlay-spec)))
+    (let ((overlay-lines (ghostgrid--region-lines (current-buffer) overlay-region))
+          (overlay-starts (ghostgrid--line-starts-in-region overlay-region)))
+      (cl-loop for base-line in base-lines
+               for overlay-line in overlay-lines
+               for line-start in overlay-starts
+               do (let ((line-end (save-excursion
+                                    (goto-char line-start)
+                                    (line-end-position))))
+                    (ghostgrid--render-line line-start line-end base-line overlay-line))))))
 
 (defun ghostgrid--schedule-refresh (&rest _ignore)
   "Schedule a debounced refresh for the current overlay buffer."
-  (when ghostgrid--refresh-timer
-    (cancel-timer ghostgrid--refresh-timer))
-  (let ((buffer (current-buffer)))
-    (setq ghostgrid--refresh-timer
-          (run-with-idle-timer
-           ghostgrid-refresh-delay nil
-           (lambda ()
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (setq ghostgrid--refresh-timer nil)
-                 (when ghostgrid-mode
-                   (ignore-errors (ghostgrid-refresh))))))))))
+  (unless ghostgrid--inhibit-refresh
+    (when ghostgrid--refresh-timer
+      (cancel-timer ghostgrid--refresh-timer))
+    (let ((buffer (current-buffer)))
+      (setq ghostgrid--refresh-timer
+            (run-with-idle-timer
+             ghostgrid-refresh-delay nil
+             (lambda ()
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq ghostgrid--refresh-timer nil)
+                   (when ghostgrid-mode
+                     (ignore-errors (ghostgrid-refresh)))))))))))
 
 (defun ghostgrid--base-after-change (&rest _ignore)
   "Refresh all overlay buffers watching the current base buffer."
@@ -317,13 +388,31 @@ LINE-START and LINE-END are positions in the overlay buffer."
       (unless ghostgrid--base-watchers
         (remove-hook 'after-change-functions #'ghostgrid--base-after-change t)))))
 
+(defun ghostgrid--before-revert ()
+  "Remove ghost overlays before `revert-buffer' replaces buffer text."
+  (when ghostgrid-mode
+    (when ghostgrid--refresh-timer
+      (cancel-timer ghostgrid--refresh-timer)
+      (setq ghostgrid--refresh-timer nil))
+    (ghostgrid--delete-overlays)))
+
+(defun ghostgrid--after-revert ()
+  "Refresh ghost overlays after `revert-buffer'."
+  (when ghostgrid-mode
+    (ghostgrid--schedule-refresh)))
+
 (defun ghostgrid--activate-entry (entry)
   "Activate ghostgrid in current overlay buffer using ENTRY."
+  ;; Be idempotent.  This matters when auto-activation and manual activation
+  ;; both touch the same buffer, and it also prevents duplicate hooks/watchers.
+  (ghostgrid--deactivate-entry)
   (setq ghostgrid--entry entry)
   (let ((base-buffer (find-file-noselect (plist-get entry :base-file))))
     (setq ghostgrid--base-buffer base-buffer)
     (ghostgrid--watch-base-buffer base-buffer (current-buffer)))
   (add-hook 'after-change-functions #'ghostgrid--schedule-refresh nil t)
+  (add-hook 'before-revert-hook #'ghostgrid--before-revert nil t)
+  (add-hook 'after-revert-hook #'ghostgrid--after-revert nil t)
   (ghostgrid-refresh))
 
 (defun ghostgrid--deactivate-entry ()
@@ -332,6 +421,8 @@ LINE-START and LINE-END are positions in the overlay buffer."
     (cancel-timer ghostgrid--refresh-timer)
     (setq ghostgrid--refresh-timer nil))
   (remove-hook 'after-change-functions #'ghostgrid--schedule-refresh t)
+  (remove-hook 'before-revert-hook #'ghostgrid--before-revert t)
+  (remove-hook 'after-revert-hook #'ghostgrid--after-revert t)
   (when ghostgrid--base-buffer
     (ghostgrid--unwatch-base-buffer ghostgrid--base-buffer (current-buffer)))
   (setq ghostgrid--base-buffer nil)
